@@ -1,0 +1,331 @@
+#!/usr/bin/env python3
+# Satellite-Image-Captioning-Model-for-Environmental-Data (Synthetic)
+# -------------------------------------------------------------------
+# Creates synthetic 4-band satellite-like patches (RGB+NIR), generates captions
+# (vegetation/urban/water/temperature/terrain), trains a CNN+LSTM captioner,
+# and saves outputs.
+#
+# Usage:
+#   python sat_image_captioning_synth.py --n 1000 --size 32 --epochs 8 --batch 64 --out outputs
+#
+# Dependencies:
+#   numpy, torch, matplotlib
+#
+# Outputs (in --out):
+#   - model.pt, vocab.json
+#   - samples.txt  (GT vs Pred for a subset)
+#   - preview.png  (grid of sample images + predicted captions)
+
+import os, json, math, argparse, random, string
+import numpy as np
+import matplotlib.pyplot as plt
+from typing import List, Tuple
+
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+
+# -----------------------------
+# 1) Utils / Repro
+# -----------------------------
+def set_seed(seed=42):
+    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+
+def smooth2d(a, k=5):
+    assert k % 2 == 1
+    pad = k // 2
+    ap = np.pad(a, ((pad, pad), (pad, pad)), mode="reflect")
+    out = np.zeros_like(a)
+    for i in range(a.shape[0]):
+        for j in range(a.shape[1]):
+            out[i, j] = ap[i:i+k, j:j+k].mean()
+    return out
+
+# -----------------------------
+# 2) Synthetic scene & captions
+# -----------------------------
+def gen_scene(ps: int, rng: np.random.Generator):
+    x = np.linspace(0, 1, ps); y = np.linspace(0, 1, ps)
+    xx, yy = np.meshgrid(x, y)
+
+    # Elevation surface + smoothing
+    elev = (0.5*np.sin(2*np.pi*xx)*np.cos(2*np.pi*yy) + 0.3*np.sin(3*np.pi*yy) + 0.2*rng.normal(size=(ps,ps)))
+    elev = smooth2d(elev,7); elev = (elev - elev.min())/(elev.max()-elev.min()+1e-9)
+
+    # Urban density around two centers
+    def rbf(cx, cy, s): return np.exp(-(((xx-cx)**2 + (yy-cy)**2)/(2*s**2)))
+    urban = 0.9*rbf(0.7,0.35,0.12) + 0.7*rbf(0.35,0.65,0.1) + 0.05*rng.normal(size=(ps,ps))
+    urban = np.clip((urban-urban.min())/(urban.max()-urban.min()+1e-9),0,1)
+
+    # Vegetation (inverse-ish of urban + topo influence)
+    veg = np.clip(1 - 0.8*urban + 0.2*(1-elev) + 0.05*rng.normal(size=(ps,ps)), 0, 1)
+
+    # Meandering river mask
+    river_center = 0.5 + 0.15*np.sin(3*np.pi*xx)
+    water_mask = (np.abs(yy - river_center) < (0.03 + 0.01*rng.random())).astype(np.float32)
+    water_mask = smooth2d(water_mask,3); water_mask = np.clip(water_mask,0,1)
+
+    # Bands (0..1): BLUE, GREEN, RED, NIR
+    BLUE  = np.clip(0.25 + 0.15*water_mask + 0.05*rng.normal(size=(ps,ps)), 0, 1)
+    GREEN = np.clip(0.3 + 0.5*veg - 0.15*urban + 0.05*rng.normal(size=(ps,ps)), 0, 1)
+    RED   = np.clip(0.3 + 0.25*urban - 0.3*veg + 0.05*rng.normal(size=(ps,ps)), 0, 1)
+    NIR   = np.clip(0.35 + 0.55*veg - 0.15*urban + 0.05*rng.normal(size=(ps,ps)), 0, 1)
+    eps = 1e-6
+    NDVI = (NIR - RED) / (NIR + RED + eps)
+
+    # Approx surface temp (scaled 0..1)
+    tir = np.clip(0.55 + 0.3*urban - 0.2*veg - 0.1*water_mask + 0.05*rng.normal(size=(ps,ps)), 0, 1)
+
+    # Simple slope proxy
+    gy, gx = np.gradient(elev); slope = np.sqrt(gx**2 + gy**2)
+    slope = (slope - slope.min())/(slope.max()-slope.min()+1e-9)
+
+    # Compose 4-band image (RGB + NIR)
+    img = np.stack([RED, GREEN, BLUE, NIR], axis=0).astype(np.float32)
+
+    # Caption from rules
+    ndvi_m = float(NDVI.mean())
+    urban_m = float(urban.mean())
+    water_f = float((water_mask>0.2).mean())
+    temp_m = float(tir.mean())
+    slope_m = float(slope.mean())
+
+    veg_tok   = "dense vegetation" if ndvi_m>0.35 else ("moderate vegetation" if ndvi_m>0.15 else "sparse vegetation")
+    water_tok = "river present" if water_f>0.02 else "no water"
+    urban_tok = "high urban density" if urban_m>0.5 else ("scattered settlements" if urban_m>0.2 else "low urban density")
+    temp_tok  = "hot surface" if temp_m>0.65 else ("mild surface" if temp_m>0.45 else "cool surface")
+    terr_tok  = "hilly terrain" if slope_m>0.35 else "flat terrain"
+
+    caption = f"{veg_tok} near {('river' if water_f>0.02 else 'dry areas')}; {urban_tok}; {temp_tok}; {terr_tok}."
+    return img, caption
+
+def build_dataset(n: int, ps: int, seed: int=42):
+    rng = np.random.default_rng(seed)
+    imgs, caps = [], []
+    for _ in range(n):
+        im, cap = gen_scene(ps, rng)
+        imgs.append(im); caps.append(cap.lower())
+    return np.stack(imgs,0), caps
+
+# -----------------------------
+# 3) Vocab & tokenization
+# -----------------------------
+SPECIALS = {"<pad>":0,"<bos>":1,"<eos>":2,"<unk>":3}
+
+def tokenize(txt:str)->List[str]:
+    tbl = str.maketrans({k:" " for k in ";,.:!?/"})
+    return txt.translate(tbl).split()
+
+def build_vocab(captions: List[str], min_freq=1):
+    from collections import Counter
+    c = Counter()
+    for t in captions: c.update(tokenize(t))
+    itos = [None]*len(SPECIALS)
+    for k,v in sorted(SPECIALS.items(), key=lambda kv: kv[1]): itos[v]=k
+    for w,f in sorted(c.items()):
+        if f>=min_freq and w not in SPECIALS: itos.append(w)
+    stoi = {w:i for i,w in enumerate(itos)}
+    return stoi, itos
+
+def encode_caption(cap:str, stoi:dict, max_len:int):
+    toks = tokenize(cap)
+    ids = [stoi.get(t, SPECIALS["<unk>"]) for t in toks]
+    ids = [SPECIALS["<bos>"]] + ids + [SPECIALS["<eos>"]]
+    if len(ids) < max_len: ids = ids + [SPECIALS["<pad>"]]*(max_len-len(ids))
+    else: ids = ids[:max_len-1] + [SPECIALS["<eos>"]]
+    return np.array(ids, dtype=np.int64)
+
+# -----------------------------
+# 4) Dataset / Collate
+# -----------------------------
+class SatCapDataset(Dataset):
+    def __init__(self, imgs, caps, stoi, max_len=20):
+        self.imgs = imgs; self.caps = caps; self.stoi=stoi; self.max_len=max_len
+    def __len__(self): return len(self.caps)
+    def __getitem__(self, i):
+        x = self.imgs[i]
+        y = encode_caption(self.caps[i], self.stoi, self.max_len)
+        return torch.from_numpy(x), torch.from_numpy(y)
+
+def collate(batch):
+    xs = torch.stack([b[0] for b in batch],0)                 # (B,4,H,W)
+    ys = torch.stack([b[1] for b in batch],0)                 # (B,L)
+    # Inputs to decoder (without last token), targets (without first)
+    dec_in  = ys[:,:-1]
+    target  = ys[:,1:]
+    return xs.float(), dec_in.long(), target.long()
+
+# -----------------------------
+# 5) Model: CNN encoder + LSTM
+# -----------------------------
+class EncoderCNN(nn.Module):
+    def __init__(self, in_ch=4, feat_dim=128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_ch, 32, 3, padding=1), nn.ReLU(True), nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(True), nn.MaxPool2d(2),
+            nn.Conv2d(64, 128, 3, padding=1), nn.ReLU(True),
+            nn.AdaptiveAvgPool2d(1)
+        )
+        self.fc = nn.Linear(128, feat_dim)
+    def forward(self, x):
+        x = self.net(x).flatten(1)
+        return self.fc(x)
+
+class DecoderLSTM(nn.Module):
+    def __init__(self, vocab_size, emb_dim=128, hid=256, feat_dim=128, pad_idx=0):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, emb_dim, padding_idx=pad_idx)
+        self.init_h = nn.Linear(feat_dim, hid)
+        self.init_c = nn.Linear(feat_dim, hid)
+        self.lstm = nn.LSTM(emb_dim, hid, num_layers=1, batch_first=True)
+        self.proj = nn.Linear(hid, vocab_size)
+    def forward(self, feats, in_tokens):
+        B = feats.size(0)
+        h0 = torch.tanh(self.init_h(feats)).unsqueeze(0)  # (1,B,H)
+        c0 = torch.tanh(self.init_c(feats)).unsqueeze(0)
+        emb = self.embed(in_tokens)                       # (B,T,E)
+        out,_ = self.lstm(emb, (h0,c0))                  # (B,T,H)
+        return self.proj(out)                             # (B,T,V)
+
+def greedy_decode(encoder, decoder, x, itos, max_len=20, device="cpu"):
+    encoder.eval(); decoder.eval()
+    with torch.no_grad():
+        feats = encoder(x.to(device))            # (1,F)
+        h = torch.tanh(decoder.init_h(feats)).unsqueeze(0)
+        c = torch.tanh(decoder.init_c(feats)).unsqueeze(0)
+        tok = torch.tensor([[SPECIALS["<bos>"]]], device=device)
+        out_words=[]
+        for _ in range(max_len-1):
+            emb = decoder.embed(tok)             # (1,1,E)
+            o,(h,c) = decoder.lstm(emb,(h,c))
+            logits = decoder.proj(o[:,-1])       # (1,V)
+            nxt = logits.argmax(-1)              # (1,1)
+            wid = nxt.item()
+            if wid==SPECIALS["<eos>"]: break
+            if wid not in (SPECIALS["<bos>"], SPECIALS["<pad>"]):
+                out_words.append(itos[wid])
+            tok = nxt
+    return " ".join(out_words)
+
+# -----------------------------
+# 6) Train loop
+# -----------------------------
+def train(modelE, modelD, train_loader, valid_loader, vocab_size, pad_idx, device, epochs=8, lr=1e-3, out_dir="outputs"):
+    ce = nn.CrossEntropyLoss(ignore_index=pad_idx)
+    opt = torch.optim.Adam(list(modelE.parameters())+list(modelD.parameters()), lr=lr)
+
+    best_loss = float("inf")
+    for ep in range(1, epochs+1):
+        modelE.train(); modelD.train()
+        tr_loss=0; n_tok=0
+        for imgs, dec_in, tgt in train_loader:
+            imgs, dec_in, tgt = imgs.to(device), dec_in.to(device), tgt.to(device)
+            feats = modelE(imgs)
+            logits = modelD(feats, dec_in)                   # (B,T,V)
+            loss = ce(logits.reshape(-1, vocab_size), tgt.reshape(-1))
+            opt.zero_grad(); loss.backward(); opt.step()
+            tr_loss += loss.item() * tgt.numel(); n_tok += tgt.numel()
+
+        # validation
+        modelE.eval(); modelD.eval()
+        va_loss=0; n_tok_v=0
+        with torch.no_grad():
+            for imgs, dec_in, tgt in valid_loader:
+                imgs, dec_in, tgt = imgs.to(device), dec_in.to(device), tgt.to(device)
+                feats = modelE(imgs)
+                logits = modelD(feats, dec_in)
+                loss = ce(logits.reshape(-1, vocab_size), tgt.reshape(-1))
+                va_loss += loss.item()*tgt.numel(); n_tok_v+=tgt.numel()
+        trp = tr_loss/n_tok; vap = va_loss/n_tok_v
+        print(f"Epoch {ep:02d} | train CE/token {trp:.4f} | valid CE/token {vap:.4f}")
+
+        if vap < best_loss:
+            best_loss = vap
+            torch.save({"enc":modelE.state_dict(),"dec":modelD.state_dict()}, os.path.join(out_dir,"model.pt"))
+
+# -----------------------------
+# 7) Preview grid
+# -----------------------------
+def save_preview(imgs, gts, preds, path, n=8):
+    n = min(n, len(gts))
+    idx = np.random.choice(len(gts), n, replace=False)
+    cols = 4; rows = int(math.ceil(n/cols))
+    plt.figure(figsize=(4*cols, 3*rows))
+    for k,i in enumerate(idx):
+        ax = plt.subplot(rows, cols, k+1)
+        # Show RGB (swap channels RED,GREEN,BLUE from our [0]=R,[1]=G,[2]=B)
+        rgb = np.stack([imgs[i,0], imgs[i,1], imgs[i,2]], axis=-1)
+        rgb = np.clip(rgb,0,1)
+        ax.imshow(rgb)
+        ax.set_title(f"Pred: {preds[i]}\nGT: {gts[i]}", fontsize=8)
+        ax.axis("off")
+    plt.tight_layout()
+    plt.savefig(path, dpi=200); plt.close()
+
+# -----------------------------
+# 8) Main
+# -----------------------------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--n", type=int, default=1000, help="Number of samples (>100).")
+    ap.add_argument("--size", type=int, default=32, help="Patch size.")
+    ap.add_argument("--epochs", type=int, default=8)
+    ap.add_argument("--batch", type=int, default=64)
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--out", type=str, default="outputs")
+    args = ap.parse_args()
+
+    if args.n <= 100: raise ValueError("--n must be > 100")
+    os.makedirs(args.out, exist_ok=True)
+    set_seed(args.seed)
+
+    print("Generating synthetic dataset...")
+    imgs, caps = build_dataset(args.n, args.size, args.seed)
+    stoi, itos = build_vocab(caps, min_freq=1)
+    vocab_size = len(itos); pad_idx = SPECIALS["<pad>"]
+
+    # Split
+    n_train = int(0.85*args.n)
+    tr_imgs, va_imgs = imgs[:n_train], imgs[n_train:]
+    tr_caps, va_caps = caps[:n_train], caps[n_train:]
+
+    max_len = 20
+    tr_ds = SatCapDataset(tr_imgs, tr_caps, stoi, max_len=max_len)
+    va_ds = SatCapDataset(va_imgs, va_caps, stoi, max_len=max_len)
+    tr_ld = DataLoader(tr_ds, batch_size=args.batch, shuffle=True, collate_fn=collate)
+    va_ld = DataLoader(va_ds, batch_size=args.batch, shuffle=False, collate_fn=collate)
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    enc = EncoderCNN(in_ch=4, feat_dim=128).to(device)
+    dec = DecoderLSTM(vocab_size=vocab_size, emb_dim=128, hid=256, feat_dim=128, pad_idx=pad_idx).to(device)
+
+    print(f"Training on {device} | vocab={vocab_size} | train={len(tr_ds)} | valid={len(va_ds)}")
+    train(enc, dec, tr_ld, va_ld, vocab_size, pad_idx, device, epochs=args.epochs, lr=1e-3, out_dir=args.out)
+
+    # Load best and predict a subset
+    ckpt = torch.load(os.path.join(args.out,"model.pt"), map_location=device)
+    enc.load_state_dict(ckpt["enc"]); dec.load_state_dict(ckpt["dec"])
+    enc.eval(); dec.eval()
+
+    print("Generating predictions...")
+    sample_idx = np.arange(min(32, len(va_ds)))
+    preds=[]; gts=[]
+    for i in sample_idx:
+        x, y = va_ds[i]
+        cap_pred = greedy_decode(enc, dec, x.unsqueeze(0), itos, max_len=max_len, device=device)
+        preds.append(cap_pred)
+        # detokenize GT
+        gt = " ".join([itos[t] for t in y.numpy() if t not in (SPECIALS["<pad>"], SPECIALS["<bos>"], SPECIALS["<eos>"])])
+        gts.append(gt)
+
+    # Save artifacts
+    with open(os.path.join(args.out,"vocab.json"),"w") as f: json.dump({"itos":itos}, f, indent=2)
+    with open(os.path.join(args.out,"samples.txt"),"w") as f:
+        for i,(p,g) in enumerate(zip(preds,gts)): f.write(f"[{i:02d}] PRED: {p}\n     GT  : {g}\n")
+
+    save_preview(va_imgs, gts, preds, os.path.join(args.out,"preview.png"), n=len(sample_idx))
+    print("Done. See outputs in:", args.out)
+
+if __name__=="__main__":
+    main()
